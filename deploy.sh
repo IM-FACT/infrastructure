@@ -150,7 +150,7 @@ main() {
     # 1. 메인 인프라 스택 배포 (EC2 기반)
     echo -e "${YELLOW}📋 Step 1: EC2 기반 메인 인프라 배포${NC}"
     deploy_stack "${STACK_PREFIX}-${ENVIRONMENT}-main" \
-                 "cloudformation/main-ec2.yml" \
+                 "cloudformation/main.yml" \
                  $MAIN_PARAMS_FILE
     
     # ECR 리포지토리 URI 가져오기
