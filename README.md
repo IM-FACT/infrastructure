@@ -1,4 +1,4 @@
-# Climate FactCheck AWS 배포 가이드 (후속작업)
+# AWS 배포 가이드 (후속작업)
 
 이 문서는 Climate FactCheck 애플리케이션을 AWS에 EC2 기반으로 배포하는 방법을 설명합니다. CloudFormation을 사용하여 Infrastructure as Code (IaC) 방식으로 안전하고 재현 가능한 배포를 제공합니다.
 
