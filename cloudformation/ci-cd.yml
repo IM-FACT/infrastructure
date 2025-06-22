@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Climate FactCheck - EC2 기반 CI/CD 파이프라인'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: 배포 환경
+
+  GitHubOwner:
+    Type: String
+    Description: GitHub 소유자 이름
+    Default: your-github-username
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub 리포지토리 이름
+    Default: climate-factcheck
+
+  GitHubBranch:
+    Type: String
+    Description: GitHub 브랜치
+    Default: main
+
+  AutoScalingGroupName:
+    Type: String
+    Description: Auto Scaling Group 이름 (메인 스택에서 import)
+
+Resources:
+  # ===== S3 버킷 (빌드 아티팩트용) =====
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Environment}-climate-factcheck-artifacts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ===== IAM 역할 =====
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildBasePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+                  - !Sub ${ArtifactStore}/*
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: '*'
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineBasePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub ${ArtifactStore}/*
+                  - !Sub ${ArtifactStore}
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: '*'
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Policies:
+        - PolicyName: AutoScalingAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:*
+                  - ec2:*
+                  - tag:GetResources
+                Resource: '*'
+
+  # ===== CodeBuild 프로젝트 =====
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Environment}-climate-factcheck-build
+      Description: Climate FactCheck 빌드 프로젝트
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: ECR_REPOSITORY_URI
+            Value: !Sub 
+              - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryName}
+              - RepositoryName: climate-factcheck
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=${COMMIT_HASH:=latest}
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - cd backend
+                - docker build -t $ECR_REPOSITORY_URI:latest .
+                - docker tag $ECR_REPOSITORY_URI:latest $ECR_REPOSITORY_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images...
+                - docker push $ECR_REPOSITORY_URI:latest
+                - docker push $ECR_REPOSITORY_URI:$IMAGE_TAG
+                - echo Writing deployment scripts...
+                # CodeDeploy용 배포 스크립트 생성
+                - mkdir -p deployment
+                - |
+                  cat > deployment/appspec.yml << 'EOF'
+                  version: 0.0
+                  os: linux
+                  hooks:
+                    BeforeInstall:
+                      - location: scripts/stop_application.sh
+                        timeout: 300
+                        runas: root
+                    ApplicationStart:
+                      - location: scripts/start_application.sh
+                        timeout: 300
+                        runas: root
+                    ApplicationStop:
+                      - location: scripts/stop_application.sh
+                        timeout: 300
+                        runas: root
+                  EOF
+                - |
+                  cat > deployment/scripts/start_application.sh << 'EOF'
+                  #!/bin/bash
+                  # 간단한 롤링 업데이트 (Launch Template 버전 업데이트)
+                  echo "새 이미지로 인스턴스 교체 중..."
+                  # 실제로는 Auto Scaling Group에서 인스턴스 교체 트리거
+                  aws autoscaling start-instance-refresh --auto-scaling-group-name $AUTO_SCALING_GROUP_NAME --region $AWS_DEFAULT_REGION
+                  EOF
+                - |
+                  cat > deployment/scripts/stop_application.sh << 'EOF'
+                  #!/bin/bash
+                  echo "애플리케이션 중지 중..."
+                  # 필요시 기존 컨테이너 정리
+                  docker stop climate-factcheck || true
+                  docker rm climate-factcheck || true
+                  EOF
+                - chmod +x deployment/scripts/*.sh
+          artifacts:
+            files: 
+              - deployment/**/*
+
+  # ===== CodeDeploy 애플리케이션 =====
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${Environment}-climate-factcheck-app
+      ComputePlatform: Server
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub ${Environment}-climate-factcheck-deployment-group
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.EC2AllAtOneTime
+      AutoScalingGroups:
+        - !Ref AutoScalingGroupName
+
+  # ===== GitHub 웹훅용 Secret =====
+  GitHubWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Environment}/climate-factcheck/github-webhook
+      Description: GitHub 웹훅 시크릿
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: token
+        ExcludeCharacters: '"@/\'
+        PasswordLength: 32
+
+  # ===== CodePipeline =====
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${Environment}-climate-factcheck-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStore
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Sub '{{resolve:secretsmanager:${GitHubWebhookSecret}:SecretString:token}}'
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              InputArtifacts:
+                - Name: BuildOutput
+
+  # ===== CloudWatch Alarms =====
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-climate-factcheck-build-failure
+      AlarmDescription: CodeBuild 빌드 실패 알림
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref CodeBuildProject
+      TreatMissingData: notBreaching
+
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-climate-factcheck-pipeline-failure
+      AlarmDescription: CodePipeline 파이프라인 실패 알림
+      MetricName: PipelineExecutionFailure
+      Namespace: AWS/CodePipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: PipelineName
+          Value: !Ref CodePipeline
+      TreatMissingData: notBreaching
+
+Outputs:
+  CodePipelineName:
+    Description: CodePipeline 이름
+    Value: !Ref CodePipeline
+    Export:
+      Name: !Sub ${Environment}-CodePipelineName
+
+  CodeBuildProjectName:
+    Description: CodeBuild 프로젝트 이름
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub ${Environment}-CodeBuildProjectName
+
+  ArtifactStoreBucket:
+    Description: 아티팩트 저장 S3 버킷
+    Value: !Ref ArtifactStore
+    Export:
+      Name: !Sub ${Environment}-ArtifactStoreBucket
+
+  CodeDeployApplicationName:
+    Description: CodeDeploy 애플리케이션 이름
+    Value: !Ref CodeDeployApplication
+    Export:
+      Name: !Sub ${Environment}-CodeDeployApplicationName 

@@ -1,0 +1,844 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Climate FactCheck RAG 시스템 - 완전 EC2 기반 메인 인프라 스택'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: 배포 환경
+  
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: VPC CIDR 블록
+  
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: 퍼블릭 서브넷 1 CIDR
+  
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: 퍼블릭 서브넷 2 CIDR
+  
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: 프라이빗 서브넷 1 CIDR
+  
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: 프라이빗 서브넷 2 CIDR
+
+  AppInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: 애플리케이션 EC2 인스턴스 타입
+
+  DBInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+    Description: 데이터베이스 EC2 인스턴스 타입
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 인스턴스 SSH 키페어 이름
+
+Resources:
+  # ===== VPC 및 네트워킹 =====
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-climate-factcheck-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-climate-factcheck-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # 퍼블릭 서브넷 (ALB, Bastion용)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-public-subnet-2
+
+  # 프라이빗 서브넷 (앱, DB, Redis용)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-private-subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-private-subnet-2
+
+  # NAT 게이트웨이 (프라이빗 서브넷 인터넷 액세스용)
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  # 라우팅 테이블
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-public-routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-private-routes-1
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-private-routes-2
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ===== 보안 그룹 =====
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-alb-sg
+      GroupDescription: ALB 보안 그룹
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP 트래픽
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS 트래픽
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-alb-sg
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-app-sg
+      GroupDescription: 애플리케이션 서버 보안 그룹
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: ALB에서 애플리케이션으로
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: Bastion에서 SSH
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-app-sg
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-database-sg
+      GroupDescription: 데이터베이스 서버 보안 그룹
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: 앱 서버에서 PostgreSQL
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: 앱 서버에서 Redis
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: Bastion에서 SSH
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-database-sg
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Environment}-bastion-sg
+      GroupDescription: Bastion 호스트 보안 그룹
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH 접속 (운영환경에서는 특정 IP로 제한 권장)
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-bastion-sg
+
+  # ===== ECR 리포지토리 =====
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: climate-factcheck
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "최신 10개 이미지만 유지",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # ===== Secrets Manager =====
+  ApplicationSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${Environment}/climate-factcheck/application
+      Description: 애플리케이션 비밀 키들
+      SecretString: !Sub |
+        {
+          "SECRET_KEY": "CHANGE_THIS_IN_PRODUCTION",
+          "OPENAI_API_KEY": "your-openai-api-key",
+          "BRAVE_AI_API_KEY": "your-brave-api-key",
+          "GOOGLE_API_KEY": "your-google-api-key",
+          "POSTGRES_PASSWORD": "imfact_password_change_this",
+          "REDIS_PASSWORD": "redis_password_change_this"
+        }
+
+  # ===== IAM 역할 =====
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref ApplicationSecrets
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ===== 최신 Amazon Linux 2023 AMI 조회 =====
+  AmazonLinuxAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  # ===== EBS 볼륨 (데이터 영속성용) =====
+  DatabaseDataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: !If [IsProduction, 100, 20]
+      VolumeType: gp3
+      Encrypted: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-database-data-volume
+
+  # ===== 데이터베이스 서버 (PostgreSQL + Redis) =====
+  DatabaseServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmazonLinuxAMI
+      InstanceType: !Ref DBInstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      SubnetId: !Ref PrivateSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          
+          # 필수 패키지 설치
+          yum install -y docker jq
+          
+          # Docker 시작
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          # 데이터 볼륨 마운트
+          mkfs.ext4 /dev/xvdf
+          mkdir -p /data
+          mount /dev/xvdf /data
+          echo '/dev/xvdf /data ext4 defaults,nofail 0 2' >> /etc/fstab
+          
+          # PostgreSQL 및 Redis 데이터 디렉토리 생성
+          mkdir -p /data/postgres /data/redis
+          chown -R 999:999 /data/postgres
+          chown -R 999:999 /data/redis
+          
+          # Secrets Manager에서 비밀번호 가져오기
+          APP_SECRET=$(aws secretsmanager get-secret-value --secret-id ${ApplicationSecrets} --query SecretString --output text)
+          POSTGRES_PASSWORD=$(echo $APP_SECRET | jq -r .POSTGRES_PASSWORD)
+          REDIS_PASSWORD=$(echo $APP_SECRET | jq -r .REDIS_PASSWORD)
+          
+          # PostgreSQL 컨테이너 실행
+          docker run -d \
+            --name postgres \
+            --restart unless-stopped \
+            -p 5432:5432 \
+            -e POSTGRES_DB=imfact \
+            -e POSTGRES_USER=imfact_user \
+            -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            -v /data/postgres:/var/lib/postgresql/data \
+            postgres:17
+          
+          # Redis 컨테이너 실행 (Redis 8.0 with Vector Search)
+          docker run -d \
+            --name redis \
+            --restart unless-stopped \
+            -p 6379:6379 \
+            -v /data/redis:/data \
+            redis/redis-stack-server:latest \
+            redis-server --requirepass "$REDIS_PASSWORD" --save 900 1 --save 300 10 --save 60 10000 --appendonly yes
+          
+          # CloudWatch Agent 설치 및 설정
+          yum install -y amazon-cloudwatch-agent
+          
+          # 헬스체크 스크립트 생성
+          cat > /opt/health-check.sh << 'EOF'
+          #!/bin/bash
+          # PostgreSQL 헬스체크
+          docker exec postgres pg_isready -U imfact_user -d imfact
+          POSTGRES_STATUS=$?
+          
+          # Redis 헬스체크
+          docker exec redis redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping
+          REDIS_STATUS=$?
+          
+          if [ $POSTGRES_STATUS -eq 0 ] && [ $REDIS_STATUS -eq 0 ]; then
+            echo "OK"
+            exit 0
+          else
+            echo "FAIL"
+            exit 1
+          fi
+          EOF
+          chmod +x /opt/health-check.sh
+          
+          # 시스템 서비스로 등록
+          cat > /etc/systemd/system/database-services.service << 'EOF'
+          [Unit]
+          Description=Database Services (PostgreSQL + Redis)
+          After=docker.service
+          Requires=docker.service
+          
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/bash -c "docker start postgres redis"
+          ExecStop=/bin/bash -c "docker stop postgres redis"
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          systemctl enable database-services
+          systemctl start database-services
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-database-server
+
+  # 데이터 볼륨 연결
+  DatabaseVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      VolumeId: !Ref DatabaseDataVolume
+      InstanceId: !Ref DatabaseServer
+      Device: /dev/xvdf
+
+  # ===== 애플리케이션 Launch Template =====
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: DatabaseServer
+    Properties:
+      LaunchTemplateName: !Sub ${Environment}-climate-factcheck-app-lt
+      LaunchTemplateData:
+        ImageId: !Ref AmazonLinuxAMI
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        KeyName: !Ref KeyPairName
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${Environment}-climate-factcheck-app
+              - Key: Environment
+                Value: !Ref Environment
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            
+            # Docker 설치
+            yum install -y docker jq
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+            
+            # CloudWatch Agent 설치
+            yum install -y amazon-cloudwatch-agent
+            
+            # ECR 로그인 및 애플리케이션 실행 스크립트
+            cat > /opt/run-app.sh << 'EOF'
+            #!/bin/bash
+            
+            # 환경변수 설정
+            export AWS_DEFAULT_REGION=${AWS::Region}
+            export ECR_REPO=${ECRRepository.RepositoryUri}
+            
+            # ECR 로그인
+            aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO
+            
+            # 기존 컨테이너 정리
+            docker stop climate-factcheck || true
+            docker rm climate-factcheck || true
+            
+            # 최신 이미지 풀
+            docker pull $ECR_REPO:latest
+            
+            # Secrets Manager에서 환경변수 가져오기
+            APP_SECRET=$(aws secretsmanager get-secret-value --secret-id ${ApplicationSecrets} --query SecretString --output text)
+            
+            SECRET_KEY=$(echo $APP_SECRET | jq -r .SECRET_KEY)
+            OPENAI_API_KEY=$(echo $APP_SECRET | jq -r .OPENAI_API_KEY)
+            BRAVE_AI_API_KEY=$(echo $APP_SECRET | jq -r .BRAVE_AI_API_KEY)
+            GOOGLE_API_KEY=$(echo $APP_SECRET | jq -r .GOOGLE_API_KEY)
+            POSTGRES_PASSWORD=$(echo $APP_SECRET | jq -r .POSTGRES_PASSWORD)
+            REDIS_PASSWORD=$(echo $APP_SECRET | jq -r .REDIS_PASSWORD)
+            
+            # 컨테이너 실행
+            docker run -d \
+              --name climate-factcheck \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              -e DATABASE_URL="postgresql+asyncpg://imfact_user:$POSTGRES_PASSWORD@${DatabaseServer.PrivateIp}:5432/imfact" \
+              -e SYNC_DATABASE_URL="postgresql+psycopg2://imfact_user:$POSTGRES_PASSWORD@${DatabaseServer.PrivateIp}:5432/imfact" \
+              -e REDIS_URL="redis://:$REDIS_PASSWORD@${DatabaseServer.PrivateIp}:6379" \
+              -e SECRET_KEY="$SECRET_KEY" \
+              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+              -e BRAVE_AI_API_KEY="$BRAVE_AI_API_KEY" \
+              -e GOOGLE_API_KEY="$GOOGLE_API_KEY" \
+              --log-driver=awslogs \
+              --log-opt awslogs-group=/aws/ec2/climate-factcheck \
+              --log-opt awslogs-region=${AWS::Region} \
+              --log-opt awslogs-stream=application \
+              $ECR_REPO:latest
+            EOF
+            
+            chmod +x /opt/run-app.sh
+            
+            # 데이터베이스 서버 준비 대기
+            sleep 60
+            
+            # CloudWatch 로그 그룹 생성
+            aws logs create-log-group --log-group-name /aws/ec2/climate-factcheck --region ${AWS::Region} || true
+            
+            # 애플리케이션 실행
+            /opt/run-app.sh
+            
+            # 부팅 시 자동 실행을 위한 서비스 등록
+            cat > /etc/systemd/system/climate-factcheck.service << 'EOF'
+            [Unit]
+            Description=Climate FactCheck Application
+            After=docker.service
+            Requires=docker.service
+            
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/opt/run-app.sh
+            ExecStop=/usr/bin/docker stop climate-factcheck
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            systemctl enable climate-factcheck
+            systemctl start climate-factcheck
+
+  # ===== CloudWatch Log Group =====
+  EC2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/ec2/climate-factcheck
+      RetentionInDays: !If [IsProduction, 14, 7]
+
+  # ===== Auto Scaling Group =====
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${Environment}-climate-factcheck-asg
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: !If [IsProduction, 2, 1]
+      MaxSize: !If [IsProduction, 6, 3]
+      DesiredCapacity: !If [IsProduction, 2, 1]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-climate-factcheck-asg
+          PropagateAtLaunch: false
+
+  # ===== Bastion Host =====
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmazonLinuxAMI
+      InstanceType: t3.nano
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y postgresql15 redis6
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-climate-factcheck-bastion
+
+  # ===== ALB =====
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${Environment}-climate-factcheck-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-climate-factcheck-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${Environment}-climate-factcheck-tg
+      Protocol: HTTP
+      Port: 8000
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ===== Auto Scaling Policy =====
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+  # ===== CloudWatch Alarms =====
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-climate-factcheck-cpu-high
+      AlarmDescription: Scale up on high CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-climate-factcheck-cpu-low
+      AlarmDescription: Scale down on low CPU
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${Environment}-VPCId
+
+  LoadBalancerURL:
+    Description: ALB URL
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${Environment}-LoadBalancerURL
+
+  DatabaseServerIP:
+    Description: 데이터베이스 서버 Private IP
+    Value: !GetAtt DatabaseServer.PrivateIp
+    Export:
+      Name: !Sub ${Environment}-DatabaseServerIP
+
+  ECRRepository:
+    Description: ECR 리포지토리 URI
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub ${Environment}-ECRRepository
+
+  BastionInstanceId:
+    Description: Bastion 인스턴스 ID
+    Value: !Ref BastionInstance
+    Export:
+      Name: !Sub ${Environment}-BastionInstanceId
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group 이름
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub ${Environment}-AutoScalingGroupName
+
+  DatabaseDataVolumeId:
+    Description: 데이터베이스 데이터 볼륨 ID
+    Value: !Ref DatabaseDataVolume
+    Export:
+      Name: !Sub ${Environment}-DatabaseDataVolumeId 

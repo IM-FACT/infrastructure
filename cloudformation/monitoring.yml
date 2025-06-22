@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Climate FactCheck - EC2 기반 모니터링 및 알림'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: 배포 환경
+
+  AutoScalingGroupName:
+    Type: String
+    Description: Auto Scaling Group 이름
+
+  LoadBalancerFullName:
+    Type: String
+    Description: ALB 전체 이름 (예: app/my-load-balancer/50dc6c495c0c9188)
+
+  TargetGroupFullName:
+    Type: String
+    Description: 타겟 그룹 전체 이름 (예: targetgroup/my-targets/73e2d6bc24d8a067)
+
+  DatabaseInstanceId:
+    Type: String
+    Description: 데이터베이스 EC2 인스턴스 ID
+
+  NotificationEmail:
+    Type: String
+    Description: 알림 받을 이메일 주소
+    Default: admin@example.com
+
+Resources:
+  # ===== SNS 토픽 (알림용) =====
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Environment}-climate-factcheck-alerts
+      DisplayName: Climate FactCheck 알림
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ===== CloudWatch 대시보드 =====
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${Environment}-climate-factcheck-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancerFullName}" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ ".", "HTTPCode_Target_2XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "title": "ALB 메트릭"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AutoScalingGroupName}" ],
+                  [ ".", "NetworkIn", ".", "." ],
+                  [ ".", "NetworkOut", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "title": "애플리케이션 EC2 메트릭"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseInstanceId}" ],
+                  [ ".", "NetworkIn", ".", "." ],
+                  [ ".", "NetworkOut", ".", "." ],
+                  [ ".", "DiskReadOps", ".", "." ],
+                  [ ".", "DiskWriteOps", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "title": "데이터베이스 EC2 메트릭"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AutoScaling", "GroupMinSize", "AutoScalingGroupName", "${AutoScalingGroupName}" ],
+                  [ ".", "GroupMaxSize", ".", "." ],
+                  [ ".", "GroupDesiredCapacity", ".", "." ],
+                  [ ".", "GroupInServiceInstances", ".", "." ],
+                  [ ".", "GroupTotalInstances", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "title": "Auto Scaling 메트릭"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/ec2/climate-factcheck'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "최근 애플리케이션 에러 로그"
+              }
+            }
+          ]
+        }
+
+  # ===== ALB 관련 알람 =====
+  ALBHighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-ALB-High-Response-Time
+      AlarmDescription: ALB 응답 시간이 높습니다
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2.0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  ALBHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-ALB-High-Error-Rate
+      AlarmDescription: ALB 5XX 에러율이 높습니다
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # ===== 애플리케이션 EC2 관련 알람 =====
+  AppEC2HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-App-EC2-High-CPU
+      AlarmDescription: 애플리케이션 EC2 CPU 사용률이 높습니다
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  AppEC2HighNetworkAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-App-EC2-High-Network
+      AlarmDescription: 애플리케이션 EC2 네트워크 사용량이 높습니다
+      MetricName: NetworkIn
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100000000  # 100MB
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # ===== 데이터베이스 EC2 관련 알람 =====
+  DatabaseEC2HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-Database-EC2-High-CPU
+      AlarmDescription: 데이터베이스 EC2 CPU 사용률이 높습니다
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DatabaseInstanceId
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  DatabaseEC2HighDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-Database-EC2-High-Disk-Usage
+      AlarmDescription: 데이터베이스 EC2 디스크 사용률이 높습니다
+      MetricName: DiskSpaceUtilization
+      Namespace: CWAgent
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DatabaseInstanceId
+        - Name: device
+          Value: /dev/xvdf
+        - Name: fstype
+          Value: ext4
+        - Name: path
+          Value: /data
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # ===== 헬스체크 알람 =====
+  HealthCheckFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-Health-Check-Failure
+      AlarmDescription: 애플리케이션 헬스체크 실패
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: breaching
+
+  # ===== Auto Scaling 관련 알람 =====
+  AutoScalingInstanceLaunchFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-AutoScaling-Launch-Failure
+      AlarmDescription: Auto Scaling 인스턴스 시작 실패
+      MetricName: GroupTotalInstances
+      Namespace: AWS/AutoScaling
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: breaching
+
+  # ===== 로그 기반 알람 (에러 로그 탐지) =====
+  ApplicationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-Application-Errors
+      AlarmDescription: 애플리케이션에서 에러가 발생했습니다
+      MetricName: !Sub ${Environment}-error-count
+      Namespace: !Sub ${Environment}/climate-factcheck
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # 로그 필터 (에러 로그 감지용)
+  ErrorLogFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /aws/ec2/climate-factcheck
+      FilterPattern: '[timestamp, request_id, level="ERROR", ...]'
+      MetricTransformations:
+        - MetricNamespace: !Sub ${Environment}/climate-factcheck
+          MetricName: !Sub ${Environment}-error-count
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ===== 복합 알람 (전체 시스템 상태) =====
+  SystemHealthAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Sub ${Environment}-System-Health
+      AlarmDescription: 전체 시스템 상태 모니터링
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmRule: !Sub |
+        ALARM(${ALBHighErrorRateAlarm}) OR 
+        ALARM(${AppEC2HighCPUAlarm}) OR 
+        ALARM(${DatabaseEC2HighCPUAlarm}) OR 
+        ALARM(${HealthCheckFailureAlarm})
+
+Outputs:
+  DashboardURL:
+    Description: CloudWatch 대시보드 URL
+    Value: !Sub 
+      - https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DashboardName}
+      - DashboardName: !Ref CloudWatchDashboard
+
+  SNSTopicArn:
+    Description: 알림 토픽 ARN
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub ${Environment}-AlertTopicArn
+
+  SystemHealthAlarmArn:
+    Description: 시스템 전체 상태 알람 ARN
+    Value: !Ref SystemHealthAlarm
+    Export:
+      Name: !Sub ${Environment}-SystemHealthAlarmArn 
